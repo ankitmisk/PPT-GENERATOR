@@ -6,7 +6,7 @@ import json
 import base64
 import time
 import requests
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_groq import ChatGroq
@@ -137,8 +137,8 @@ use_research = st.checkbox("Enrich content with live web research (uses Tavily)"
 img_col1, img_col2 = st.columns([1, 1])
 with img_col1:
     include_images = st.checkbox(
-        "🖼️ Generate AI images for slides (Gemini 2.5 Flash Image, ~500/day free)",
-        value=False, disabled=not GOOGLE_API_KEY,
+        "🖼️ Generate AI images for slides (Pollinations.ai, free, no key)",
+        value=False,
     )
 IMAGE_STYLES = {
     "Flat vector illustration": "flat vector illustration style, clean shapes, simple color palette, no text in image",
@@ -162,43 +162,47 @@ def search_topic_facts(query):
 
 
 # =====================================================================
-# Gemini 2.5 Flash Image ("Nano Banana") — uses the SAME Google API key
-# already entered above, no separate key/service needed. Free tier is
-# roughly 500 image requests/day (subject to Google's current limits).
+# Pollinations.ai — free, no API key required at all, so this sidesteps
+# per-minute rate limits tied to any of your other keys. It's a simple
+# GET request that returns raw image bytes directly.
 # =====================================================================
-GEMINI_IMAGE_MODEL = "gemini-2.5-flash-image"
+POLLINATIONS_BASE_URL = "https://image.pollinations.ai/prompt/"
 
 
-def generate_image_bytes(prompt: str, api_key: str, style_suffix: str = "", max_retries: int = 4) -> bytes:
-    """Calls the Gemini image-generation REST endpoint directly and returns
-    raw image bytes. Retries with backoff on 429 (the free tier's per-minute
-    rate limit is much tighter than the daily quota, so bursts of several
-    slides in a row commonly trip it). Raises on final failure (caller
-    should catch and warn)."""
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_IMAGE_MODEL}:generateContent?key={api_key}"
-    full_prompt = f"{prompt}. Style: {style_suffix}".strip()
-    payload = {"contents": [{"parts": [{"text": full_prompt}]}]}
+def generate_image_bytes(prompt: str, style_suffix: str = "", width: int = 1024, height: int = 1024,
+                          max_retries: int = 4, seed: int = None) -> bytes:
+    """Fetches an AI-generated image from Pollinations.ai (no key needed).
+    Retries with backoff on rate-limit/server errors. Raises on final
+    failure (caller should catch and warn)."""
+    full_prompt = f"{prompt}, {style_suffix}".strip(", ")
+    encoded_prompt = quote(full_prompt)
+    url = f"{POLLINATIONS_BASE_URL}{encoded_prompt}"
+    params = {"width": width, "height": height, "nologo": "true"}
+    if seed is not None:
+        params["seed"] = seed
 
     for attempt in range(max_retries + 1):
-        resp = requests.post(url, json=payload, timeout=60)
-        if resp.status_code == 429:
+        try:
+            resp = requests.get(url, params=params, timeout=90)
+        except requests.exceptions.RequestException:
+            if attempt >= max_retries:
+                raise
+            time.sleep(min(3 * (2 ** attempt), 20))
+            continue
+
+        if resp.status_code in (429, 502, 503):
             if attempt >= max_retries:
                 resp.raise_for_status()
             retry_after = resp.headers.get("Retry-After")
-            wait_s = float(retry_after) if retry_after else min(4 * (2 ** attempt), 30)
+            wait_s = float(retry_after) if retry_after else min(3 * (2 ** attempt), 20)
             time.sleep(wait_s)
             continue
+
         resp.raise_for_status()
-        data = resp.json()
-        candidates = data.get("candidates", [])
-        if not candidates:
-            raise ValueError(f"No candidates returned: {data}")
-        parts = candidates[0].get("content", {}).get("parts", [])
-        for part in parts:
-            inline = part.get("inlineData") or part.get("inline_data")
-            if inline and inline.get("data"):
-                return base64.b64decode(inline["data"])
-        raise ValueError("Model did not return image data (it may have replied with text only).")
+        content_type = resp.headers.get("Content-Type", "")
+        if "image" not in content_type or len(resp.content) < 500:
+            raise ValueError(f"Unexpected non-image response: {resp.text[:200]}")
+        return resp.content
 
     raise RuntimeError("Rate limited after multiple retries.")
 
@@ -294,7 +298,7 @@ if st.button("✨ Generate Presentation"):
                 slides = None
 
             slide_images = {}
-            if slides and include_images and GOOGLE_API_KEY:
+            if slides and include_images:
                 img_slots = [(i, s) for i, s in enumerate(slides) if (s.get("image_prompt") or "").strip()]
                 if img_slots:
                     progress = st.progress(0, text=f"Generating image 1/{len(img_slots)}...")
@@ -303,7 +307,7 @@ if st.button("✨ Generate Presentation"):
                         progress.progress(n / len(img_slots), text=f"Generating image {n + 1}/{len(img_slots)}...")
                         try:
                             slide_images[i] = generate_image_bytes(
-                                prompt, GOOGLE_API_KEY, style_suffix=IMAGE_STYLES[image_style]
+                                prompt, style_suffix=IMAGE_STYLES[image_style]
                             )
                         except Exception as e:
                             st.warning(f"Image generation failed for slide {i + 1} ('{prompt[:40]}...'): {e}")
@@ -676,7 +680,7 @@ if st.session_state.slides:
         (i, s) for i, s in enumerate(slides)
         if (s.get("image_prompt") or "").strip() and i not in slide_images
     ]
-    if missing and GOOGLE_API_KEY:
+    if missing:
         st.warning(f"{len(missing)} image(s) didn't generate (likely rate-limited).")
         if st.button(f"🔁 Retry {len(missing)} missing image(s)"):
             progress = st.progress(0, text="Retrying...")
@@ -684,7 +688,7 @@ if st.session_state.slides:
                 prompt = s["image_prompt"].strip()
                 progress.progress(n / len(missing), text=f"Retrying image {n + 1}/{len(missing)}...")
                 try:
-                    slide_images[i] = generate_image_bytes(prompt, GOOGLE_API_KEY, style_suffix=IMAGE_STYLES[image_style])
+                    slide_images[i] = generate_image_bytes(prompt, style_suffix=IMAGE_STYLES[image_style])
                 except Exception as e:
                     st.warning(f"Still failed for slide {i + 1}: {e}")
                 if n < len(missing) - 1:
