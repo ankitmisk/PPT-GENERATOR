@@ -4,6 +4,7 @@ import io
 import re
 import json
 import base64
+import requests
 from urllib.parse import urlparse
 
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -94,6 +95,8 @@ if "template_key" not in st.session_state:
     st.session_state.template_key = "minimal_light"
 if "slides" not in st.session_state:
     st.session_state.slides = None
+if "slide_images" not in st.session_state:
+    st.session_state.slide_images = {}
 if "pptx_bytes" not in st.session_state:
     st.session_state.pptx_bytes = None
 
@@ -130,6 +133,22 @@ topic_prompt = st.text_area("Describe your presentation", placeholder="e.g. A pi
 slide_count = st.slider("Number of slides", 5, 15, 8)
 use_research = st.checkbox("Enrich content with live web research (uses Tavily)", value=False, disabled=not TAVILY_API_KEY)
 
+img_col1, img_col2 = st.columns([1, 1])
+with img_col1:
+    include_images = st.checkbox(
+        "🖼️ Generate AI images for slides (Gemini 2.5 Flash Image, ~500/day free)",
+        value=False, disabled=not GOOGLE_API_KEY,
+    )
+IMAGE_STYLES = {
+    "Flat vector illustration": "flat vector illustration style, clean shapes, simple color palette, no text in image",
+    "Photorealistic": "photorealistic photo, natural lighting, high detail, no text in image",
+    "3D render": "3D rendered illustration, soft studio lighting, modern, no text in image",
+    "Minimal line art": "minimal line-art illustration, single accent color, lots of white space, no text in image",
+    "Watercolor": "soft watercolor illustration style, gentle colors, artistic, no text in image",
+}
+with img_col2:
+    image_style = st.selectbox("Image style", list(IMAGE_STYLES.keys()), disabled=not include_images)
+
 
 # =====================================================================
 # TOOL: optional Tavily research (used only if key + checkbox provided)
@@ -139,6 +158,34 @@ def search_topic_facts(query):
     to help ground the generated slide content."""
     client = TavilyClient(api_key=TAVILY_API_KEY)
     return client.search(query, search_depth="basic", max_results=5)
+
+
+# =====================================================================
+# Gemini 2.5 Flash Image ("Nano Banana") — uses the SAME Google API key
+# already entered above, no separate key/service needed. Free tier is
+# roughly 500 image requests/day (subject to Google's current limits).
+# =====================================================================
+GEMINI_IMAGE_MODEL = "gemini-2.5-flash-image"
+
+
+def generate_image_bytes(prompt: str, api_key: str, style_suffix: str = "") -> bytes:
+    """Calls the Gemini image-generation REST endpoint directly and returns
+    raw image bytes. Raises on failure (caller should catch and warn)."""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_IMAGE_MODEL}:generateContent?key={api_key}"
+    full_prompt = f"{prompt}. Style: {style_suffix}".strip()
+    payload = {"contents": [{"parts": [{"text": full_prompt}]}]}
+    resp = requests.post(url, json=payload, timeout=60)
+    resp.raise_for_status()
+    data = resp.json()
+    candidates = data.get("candidates", [])
+    if not candidates:
+        raise ValueError(f"No candidates returned: {data}")
+    parts = candidates[0].get("content", {}).get("parts", [])
+    for part in parts:
+        inline = part.get("inlineData") or part.get("inline_data")
+        if inline and inline.get("data"):
+            return base64.b64decode(inline["data"])
+    raise ValueError("Model did not return image data (it may have replied with text only).")
 
 
 def get_model():
@@ -156,14 +203,19 @@ Create a slide-by-slide outline for a presentation deck.
 STRICT OUTPUT RULES:
 - Output ONLY a valid JSON array. No prose, no markdown fences, no explanations.
 - Each element is an object with exactly these fields:
-  "layout": one of "title", "content", "two_column", "quote", "section", "closing"
+  "layout": one of "title", "content", "two_column", "quote", "section", "closing", "image_focus"
   "title": short slide title (string)
   "subtitle": optional subtitle or empty string
-  "bullets": array of short strings (3-5 items for "content"/"two_column", empty array [] for "title"/"section"/"quote"/"closing")
+  "bullets": array of short strings (3-5 items for "content"/"two_column", empty array [] for other layouts)
   "notes": one-sentence speaker note (string)
+  "image_prompt": a short (under 15 words), purely descriptive, literal visual prompt for an
+    AI image generator (e.g. "laptop on a desk with a rising bar chart on screen, office background"),
+    or an empty string "" if this slide doesn't need an image. {image_instruction}
 - The FIRST slide must have layout "title" (deck title + subtitle, bullets: []).
 - The LAST slide must have layout "closing" (thank you / next steps / contact, bullets: []).
 - If the deck has more than 6 slides, include at least one "section" divider slide.
+- Use layout "image_focus" (title + supporting caption + a required image_prompt, bullets: [])
+  for at most one or two slides where a single strong visual should dominate the slide.
 - Produce exactly {slide_count} slide objects total.
 - Keep bullet text concise (under 12 words each).
 
@@ -200,8 +252,14 @@ if st.button("✨ Generate Presentation"):
                 except Exception as e:
                     st.warning(f"Web research skipped ({e}). Continuing without it.")
 
+            image_instruction = (
+                "Add an image_prompt for roughly half the slides where a visual would help."
+                if include_images else
+                "Leave image_prompt as an empty string for every slide (images are disabled)."
+            )
             prompt_text = SLIDE_JSON_INSTRUCTIONS.format(
-                slide_count=slide_count, topic=topic_prompt, research_context=research_context
+                slide_count=slide_count, topic=topic_prompt, research_context=research_context,
+                image_instruction=image_instruction,
             )
 
             model1 = get_model()
@@ -220,19 +278,46 @@ if st.button("✨ Generate Presentation"):
                 st.error(f"Couldn't parse the generated content as JSON, please try again. Details: {e}")
                 slides = None
 
+            slide_images = {}
+            if slides and include_images and GOOGLE_API_KEY:
+                with st.spinner("Generating images for your slides..."):
+                    for i, s in enumerate(slides):
+                        prompt = (s.get("image_prompt") or "").strip()
+                        if not prompt:
+                            continue
+                        try:
+                            slide_images[i] = generate_image_bytes(
+                                prompt, GOOGLE_API_KEY, style_suffix=IMAGE_STYLES[image_style]
+                            )
+                        except Exception as e:
+                            st.warning(f"Image generation failed for slide {i + 1} ('{prompt[:40]}...'): {e}")
+
             if slides:
                 st.session_state.slides = slides
+                st.session_state.slide_images = slide_images
                 st.session_state.pptx_bytes = None
         if st.session_state.slides:
-            st.success(f"Generated {len(st.session_state.slides)} slides!")
+            n_imgs = len(st.session_state.get("slide_images") or {})
+            msg = f"Generated {len(st.session_state.slides)} slides!"
+            if n_imgs:
+                msg += f" ({n_imgs} image{'s' if n_imgs != 1 else ''} generated)"
+            st.success(msg)
 
 
 # =====================================================================
 # HTML DECK RENDERER
 # =====================================================================
-def render_html_deck(slides, theme):
+def render_html_deck(slides, theme, slide_images=None):
+    slide_images = slide_images or {}
     bg_css = f"linear-gradient(135deg,{theme['gradient'][0]},{theme['gradient'][1]})" if "gradient" in theme else theme["bg"]
     gfont_url = "https://fonts.googleapis.com/css2?family=" + theme["gfont"] + "&display=swap"
+
+    def img_tag(i):
+        img_bytes = slide_images.get(i)
+        if not img_bytes:
+            return None
+        b64 = base64.b64encode(img_bytes).decode()
+        return f'<img class="slide-img" src="data:image/png;base64,{b64}" />'
 
     slide_html_blocks = []
     for i, s in enumerate(slides):
@@ -240,14 +325,26 @@ def render_html_deck(slides, theme):
         title = s.get("title", "")
         subtitle = s.get("subtitle", "")
         bullets = s.get("bullets", []) or []
+        image_html = img_tag(i)
 
-        if layout == "title":
+        if layout == "image_focus" and image_html:
             body = f"""
-              <div class="layout-title">
+              <div class="layout-image-focus">
+                <div class="img-pane full">{image_html}</div>
+                <div class="caption-bar">
+                  <h2>{title}</h2>
+                  {f'<p class="subtitle">{subtitle}</p>' if subtitle else ''}
+                </div>
+              </div>"""
+        elif layout in ("title", "closing"):
+            text_block = f"""
                 <h1>{title}</h1>
                 {f'<p class="subtitle">{subtitle}</p>' if subtitle else ''}
-                <div class="accent-line"></div>
-              </div>"""
+                <div class="accent-line"></div>"""
+            if image_html and layout == "title":
+                body = f'<div class="layout-split"><div class="text-pane">{text_block}</div><div class="img-pane">{image_html}</div></div>'
+            else:
+                body = f'<div class="layout-title">{text_block}</div>'
         elif layout == "section":
             body = f"""
               <div class="layout-section">
@@ -261,13 +358,6 @@ def render_html_deck(slides, theme):
                 <div class="quote-mark">&ldquo;</div>
                 <p class="quote-text">{title}</p>
                 {f'<p class="subtitle">— {subtitle}</p>' if subtitle else ''}
-              </div>"""
-        elif layout == "closing":
-            body = f"""
-              <div class="layout-title">
-                <h1>{title}</h1>
-                {f'<p class="subtitle">{subtitle}</p>' if subtitle else ''}
-                <div class="accent-line"></div>
               </div>"""
         elif layout == "two_column":
             half = (len(bullets) + 1) // 2
@@ -284,15 +374,18 @@ def render_html_deck(slides, theme):
               </div>"""
         else:  # "content"
             items = "".join(f"<li>{b}</li>" for b in bullets)
-            body = f"""
-              <div class="layout-content">
+            text_block = f"""
                 <h2>{title}</h2>
                 {f'<p class="subtitle">{subtitle}</p>' if subtitle else ''}
-                <ul>{items}</ul>
-              </div>"""
+                <ul>{items}</ul>"""
+            if image_html:
+                body = f'<div class="layout-split"><div class="text-pane">{text_block}</div><div class="img-pane">{image_html}</div></div>'
+            else:
+                body = f'<div class="layout-content">{text_block}</div>'
 
         active = "active" if i == 0 else ""
-        slide_html_blocks.append(f'<section class="slide {active}" data-index="{i}">{body}</section>')
+        extra_cls = "no-pad" if (layout == "image_focus" and image_html) else ""
+        slide_html_blocks.append(f'<section class="slide {active} {extra_cls}" data-index="{i}">{body}</section>')
 
     slides_markup = "\n".join(slide_html_blocks)
 
@@ -328,6 +421,17 @@ def render_html_deck(slides, theme):
   li::marker {{ color: var(--accent); }}
   .two-col {{ display:flex; gap:40px; }}
   .two-col ul {{ flex:1; }}
+  .layout-split {{ display:flex; align-items:center; gap:5%; width:100%; height:100%; }}
+  .layout-split .text-pane {{ flex:1.1; min-width:0; }}
+  .layout-split .img-pane {{ flex:0.9; min-width:0; height:70%; }}
+  .slide-img {{ width:100%; height:100%; object-fit:cover; border-radius:12px; box-shadow:0 8px 24px rgba(0,0,0,0.25); }}
+  .slide.no-pad {{ padding:0; }}
+  .layout-image-focus {{ position:relative; width:100%; height:100%; }}
+  .layout-image-focus .img-pane.full {{ width:100%; height:100%; }}
+  .layout-image-focus .img-pane.full .slide-img {{ border-radius:0; }}
+  .layout-image-focus .caption-bar {{ position:absolute; left:0; right:0; bottom:0; padding:5% 8%;
+      background:linear-gradient(to top, rgba(0,0,0,0.75), rgba(0,0,0,0)); }}
+  .layout-image-focus .caption-bar h2, .layout-image-focus .caption-bar .subtitle {{ color:#fff; margin:0; }}
   .nav-bar {{ display:flex; align-items:center; justify-content:space-between; margin-top:14px; color:#e2e8f0; font-family:sans-serif; font-size:13px; }}
   .nav-btn {{ background: var(--accent); color:#111; border:none; padding:8px 16px; border-radius:8px; cursor:pointer; font-weight:600; }}
   .nav-btn:disabled {{ opacity:0.35; cursor:default; }}
@@ -432,7 +536,16 @@ def add_accent_bar(slide, theme, left, top, width, height):
     return shape
 
 
-def build_pptx(slides, theme):
+def add_picture(slide, image_bytes, left, top, width, height):
+    """Embeds an image stretched to fill the given box. python-pptx has no
+    built-in CSS-style object-fit:cover, so very wide/tall source images may
+    look slightly stretched; Gemini image output is close to square by
+    default so this is rarely noticeable in practice."""
+    return slide.shapes.add_picture(io.BytesIO(image_bytes), Inches(left), Inches(top), Inches(width), Inches(height))
+
+
+def build_pptx(slides, theme, slide_images=None):
+    slide_images = slide_images or {}
     prs = Presentation()
     prs.slide_width = Inches(13.333)
     prs.slide_height = Inches(7.5)
@@ -444,16 +557,29 @@ def build_pptx(slides, theme):
     body_font = "Calibri"
     title_font = "Calibri"
 
-    for s in slides:
+    for idx, s in enumerate(slides):
         layout = s.get("layout", "content")
         title = s.get("title", "")
         subtitle = s.get("subtitle", "")
         bullets = s.get("bullets", []) or []
         notes = s.get("notes", "")
+        image_bytes = slide_images.get(idx)
 
         slide = prs.slides.add_slide(blank_layout)
 
-        if layout == "section":
+        if layout == "image_focus" and image_bytes:
+            add_picture(slide, image_bytes, 0, 0, 13.333, 7.5)
+            caption_h = 1.9
+            cap = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(0), Inches(7.5 - caption_h), Inches(13.333), Inches(caption_h))
+            cap.fill.solid()
+            cap.fill.fore_color.rgb = RGBColor(0x00, 0x00, 0x00)
+            cap.line.fill.background()
+            cap.shadow.inherit = False
+            add_text(slide, 0.9, 7.5 - caption_h + 0.35, 11.5, 0.9, title, 28, RGBColor(0xFF, 0xFF, 0xFF), bold=True, font_name=title_font)
+            if subtitle:
+                add_text(slide, 0.9, 7.5 - caption_h + 1.05, 11.5, 0.6, subtitle, 15, RGBColor(0xFF, 0xFF, 0xFF), font_name=body_font)
+
+        elif layout == "section":
             set_slide_background(slide, theme, variant="section")
             title_clr = RGBColor(0xFF, 0xFF, 0xFF) if not theme.get("gradient") else text_clr
             add_accent_bar(slide, theme, 0.9, 3.0, 0.6, 0.12)
@@ -463,10 +589,17 @@ def build_pptx(slides, theme):
 
         elif layout in ("title", "closing"):
             set_slide_background(slide, theme)
-            add_text(slide, 0.9, 2.7, 11.5, 1.6, title, 40, text_clr, bold=True, font_name=title_font)
-            if subtitle:
-                add_text(slide, 0.9, 3.9, 11.5, 0.8, subtitle, 18, text_clr, font_name=body_font)
-            add_accent_bar(slide, theme, 0.9, 4.5, 0.9, 0.09)
+            if image_bytes and layout == "title":
+                add_text(slide, 0.9, 2.5, 5.6, 1.6, title, 34, text_clr, bold=True, font_name=title_font)
+                if subtitle:
+                    add_text(slide, 0.9, 3.7, 5.6, 0.8, subtitle, 16, text_clr, font_name=body_font)
+                add_accent_bar(slide, theme, 0.9, 4.3, 0.9, 0.09)
+                add_picture(slide, image_bytes, 7.0, 1.2, 5.4, 5.1)
+            else:
+                add_text(slide, 0.9, 2.7, 11.5, 1.6, title, 40, text_clr, bold=True, font_name=title_font)
+                if subtitle:
+                    add_text(slide, 0.9, 3.9, 11.5, 0.8, subtitle, 18, text_clr, font_name=body_font)
+                add_accent_bar(slide, theme, 0.9, 4.5, 0.9, 0.09)
 
         elif layout == "quote":
             set_slide_background(slide, theme)
@@ -488,10 +621,17 @@ def build_pptx(slides, theme):
         else:  # "content"
             set_slide_background(slide, theme)
             add_accent_bar(slide, theme, 0.0, 0.0, 0.18, 7.5)
-            add_text(slide, 0.9, 0.6, 11.5, 1.0, title, 30, text_clr, bold=True, font_name=title_font)
-            if subtitle:
-                add_text(slide, 0.9, 1.35, 11.5, 0.6, subtitle, 15, text_clr, font_name=body_font)
-            add_bullets(slide, 0.9, 2.2, 11.5, 4.6, bullets, 18, text_clr, font_name=body_font)
+            if image_bytes:
+                add_text(slide, 0.9, 0.6, 6.2, 1.0, title, 28, text_clr, bold=True, font_name=title_font)
+                if subtitle:
+                    add_text(slide, 0.9, 1.35, 6.2, 0.6, subtitle, 14, text_clr, font_name=body_font)
+                add_bullets(slide, 0.9, 2.2, 6.2, 4.6, bullets, 16, text_clr, font_name=body_font)
+                add_picture(slide, image_bytes, 7.6, 0.9, 4.8, 5.7)
+            else:
+                add_text(slide, 0.9, 0.6, 11.5, 1.0, title, 30, text_clr, bold=True, font_name=title_font)
+                if subtitle:
+                    add_text(slide, 0.9, 1.35, 11.5, 0.6, subtitle, 15, text_clr, font_name=body_font)
+                add_bullets(slide, 0.9, 2.2, 11.5, 4.6, bullets, 18, text_clr, font_name=body_font)
 
         if notes:
             slide.notes_slide.notes_text_frame.text = notes
@@ -507,7 +647,8 @@ def build_pptx(slides, theme):
 # =====================================================================
 if st.session_state.slides:
     slides = st.session_state.slides
-    html_deck = render_html_deck(slides, theme)
+    slide_images = st.session_state.slide_images or {}
+    html_deck = render_html_deck(slides, theme, slide_images)
 
     st.divider()
     st.subheader("👀 Preview")
@@ -528,7 +669,7 @@ if st.session_state.slides:
         if st.button("Prepare PPTX", width="stretch"):
             try:
                 with st.spinner("Building your .pptx file..."):
-                    st.session_state.pptx_bytes = build_pptx(slides, theme)
+                    st.session_state.pptx_bytes = build_pptx(slides, theme, slide_images)
             except Exception as e:
                 st.error(f"PPTX generation failed: {e}")
         if st.session_state.pptx_bytes:
