@@ -26,12 +26,12 @@ file or a real, editable PowerPoint (.pptx).
   two-column, quote, section divider, closing, and image-focus — each styled per template.
 - **AI-generated images (optional)** — toggle "🖼️ Generate AI images for
   slides" to have the agent decide which slides need a visual, write a short
-  image prompt for each, and generate it with **Gemini 2.5 Flash Image**
-  ("Nano Banana") using the *same* Google API key already entered above (no
-  separate image API/key needed). Pick from 5 image styles (flat vector,
-  photorealistic, 3D render, line art, watercolor) applied consistently
-  across the deck. Images are embedded directly in both the HTML preview and
-  the PPTX (as real embedded pictures, not links).
+  image prompt for each, and generate it with **Pollinations.ai** — a free
+  image-generation service that needs **no API key at all**. Pick from 5
+  image styles (flat vector, photorealistic, 3D render, line art,
+  watercolor) applied consistently across the deck. Images are embedded
+  directly in both the HTML preview and the PPTX (as real embedded
+  pictures, not links).
 - **Live HTML preview** with prev/next buttons and keyboard arrow navigation,
   right inside the app.
 - **Speaker notes** are included in the downloaded PPTX (visible in
@@ -77,12 +77,13 @@ Then:
   identically to their HTML counterparts, including gradient backgrounds.
 - If the AI's output isn't valid JSON (rare), the app shows an error and
   asks you to regenerate rather than guessing at broken content.
-- **Image generation** uses Google's `gemini-2.5-flash-image` model via a
-  direct REST call (`generativelanguage.googleapis.com`). The free tier is
-  roughly 500 requests/day at the time of writing, but Google's limits can
-  change — check https://ai.google.dev for current quotas. If an image fails
-  to generate (quota, safety filter, etc.), that one slide just falls back
-  to a text-only layout and the rest of the deck still completes.
-- `gemini-3-pro-image-preview` ("Nano Banana Pro") is a separate, higher-end
-  model with **no free tier** — this app intentionally uses the Flash Image
-  model instead to stay within the free quota.
+- **Image generation** uses [Pollinations.ai](https://pollinations.ai), a
+  free text-to-image service accessed via a simple GET request — no API key
+  needed, so it's independent of your Google/Groq/Tavily key limits. It's a
+  shared community service, so occasional slowdowns or a failed image are
+  possible; failures fall back to a text-only layout for that slide and a
+  "🔁 Retry missing image(s)" button appears so you don't have to regenerate
+  the whole deck.
+- Requests to Pollinations are paced (~2.5s apart) with retry/backoff on
+  rate-limit or server errors, to stay well-behaved with their free
+  infrastructure.
