@@ -1,0 +1,9 @@
+# Core app
+streamlit
+langchain
+langchain-google-genai
+langchain-groq
+tavily-python
+
+# Slide/document generation
+python-pptx
